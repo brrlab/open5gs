@@ -30,6 +30,12 @@ int app_initialize(const char *const argv[])
     }
     ogs_info("UDM initialize...done");
 
+    //Kryptonite
+    if (hsm_config_load("/home/user/open5gs/install/etc/open5gs/hsm.yaml") != 0) {
+        ogs_warn("HSM config not loaded, HSM disabled");
+	}
+    //Kryptonite
+    
     return OGS_OK;
 }
 
