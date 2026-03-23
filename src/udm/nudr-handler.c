@@ -19,6 +19,9 @@
 
 #include "nudr-handler.h"
 #include "sbi-path.h"
+#include "sidf.h"
+#include "s3g256.h"
+#include "s3g5g.h"
 
 bool udm_nudr_dr_handle_subscription_authentication(
     udm_ue_t *udm_ue, ogs_sbi_stream_t *stream, ogs_sbi_message_t *recvmsg)
@@ -202,23 +205,94 @@ bool udm_nudr_dr_handle_subscription_authentication(
                 return false;
             }
 
+            /* ===== [HSM] SIDF: SUCI → SUPI + RAND_UE ===== */
+            if (!udm_ue->supi && udm_ue->suci) {
+                uint8_t suci_bin[85];
+                if (strlen(udm_ue->suci) != 170) {
+                    ogs_error("[%s] Invalid SUCI length", udm_ue->suci);
+                    ogs_assert(true ==
+                        ogs_sbi_server_send_error(stream, OGS_SBI_HTTP_STATUS_BAD_REQUEST,
+                            recvmsg, "Invalid SUCI length", udm_ue->suci, NULL));
+                    return false;
+                }
+                if (ogs_ascii_to_hex(udm_ue->suci, 170, suci_bin, 85) != 85) {
+                    ogs_error("[%s] Invalid SUCI hex", udm_ue->suci);
+                    ogs_assert(true ==
+                        ogs_sbi_server_send_error(stream, OGS_SBI_HTTP_STATUS_BAD_REQUEST,
+                            recvmsg, "Invalid SUCI hex", udm_ue->suci, NULL));
+                    return false;
+                }
+
+                uint8_t supi_bin[8];
+                uint8_t rand_ue[33];
+                uint8_t fupk, key_id;
+
+                if (sidf_decrypt_suci(suci_bin, 85, supi_bin, rand_ue, &fupk, &key_id) == 0) {
+                    /* Преобразование SUPI из BCD в строку IMSI */
+                    char imsi[16];
+                    int i;
+                    for (i = 0; i < 15; i++) {
+                        uint8_t nibble = (supi_bin[i/2] >> (4 * (1 - (i%2)))) & 0x0F;
+                        if (nibble > 9) break;
+                        imsi[i] = '0' + nibble;
+                    }
+                    imsi[15] = '\0';
+                    udm_ue->supi = ogs_strdup(imsi);
+                    ogs_assert(udm_ue->supi);
+                    memcpy(udm_ue->rand_ue, rand_ue, 33);
+                    udm_ue->rand_ue_valid = true;
+                    ogs_info("[HSM] SIDF decrypted SUCI to SUPI=%s", imsi);
+                } else {
+                    ogs_error("[%s] SIDF decryption failed", udm_ue->suci);
+                    ogs_assert(true ==
+                        ogs_sbi_server_send_error(stream, OGS_SBI_HTTP_STATUS_INTERNAL_SERVER_ERROR,
+                            recvmsg, "HSM error", udm_ue->suci, NULL));
+                    return false;
+                }
+            }
+
             memset(&AuthenticationInfoResult,
                     0, sizeof(AuthenticationInfoResult));
 
             AuthenticationInfoResult.supi = udm_ue->supi;
             AuthenticationInfoResult.auth_type = udm_ue->auth_type;
 
-            ogs_random(udm_ue->rand, OGS_RAND_LEN);
-#if 0
-            OGS_HEX(tmp[step], strlen(tmp[step]), udm_ue->rand);
-#if 0
-            if (step == 0) step = 1; /* For supporting authentication failure */
-            else step = 0;
-#endif
-#endif
+            /* ===== [HSM] Выбор алгоритма по AMF ===== */
+            uint16_t amf_val = (udm_ue->amf[0] << 8) | udm_ue->amf[1];
 
-            milenage_generate(udm_ue->opc, udm_ue->amf, udm_ue->k, udm_ue->sqn,
-                    udm_ue->rand, autn, ik, ck, ak, xres, &xres_len);
+            if (amf_val == 0x8000) {
+                /* Milenage */
+                ogs_random(udm_ue->rand, OGS_RAND_LEN);
+                milenage_generate(udm_ue->opc, udm_ue->amf, udm_ue->k, udm_ue->sqn,
+                                  udm_ue->rand, autn, ik, ck, ak, xres, &xres_len);
+                ogs_info("[HSM] Using Milenage");
+            }
+            else if (amf_val == 0x8010) {
+                /* S3G-256 */
+                if (s3g256_generate(udm_ue->opc, udm_ue->amf, udm_ue->k, udm_ue->sqn,
+                                    udm_ue->rand, autn, ik, ck, ak, xres, &xres_len) != 0) {
+                    ogs_error("[HSM] S3G-256 generation failed");
+                    return false;
+                }
+                ogs_info("[HSM] Using S3G-256");
+            }
+            else if (amf_val == 0x8020) {
+                /* S3G-5G */
+                if (!udm_ue->rand_ue_valid) {
+                    ogs_error("[HSM] RAND_UE missing for S3G-5G");
+                    return false;
+                }
+                if (s3g5g_generate(udm_ue->k, udm_ue->amf, udm_ue->sqn, udm_ue->rand_ue,
+                                   udm_ue->rand, autn, ik, ck, ak, xres, &xres_len) != 0) {
+                    ogs_error("[HSM] S3G-5G generation failed");
+                    return false;
+                }
+                ogs_info("[HSM] Using S3G-5G");
+            }
+            else {
+                ogs_error("[HSM] Unsupported AMF 0x%04x", amf_val);
+                return false;
+            }
 
             ogs_assert(udm_ue->serving_network_name);
 
