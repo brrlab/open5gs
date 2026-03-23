@@ -20,6 +20,9 @@
 #include "sbi-path.h"
 #include "nnrf-handler.h"
 #include "nudm-handler.h"
+#include "sidf.h"
+#include "s3g256.h"
+#include "s3g5g.h"
 
 bool udm_nudm_ueau_handle_get(
     udm_ue_t *udm_ue, ogs_sbi_stream_t *stream, ogs_sbi_message_t *recvmsg)
@@ -72,6 +75,51 @@ bool udm_nudm_ueau_handle_get(
 
     ResynchronizationInfo = AuthenticationInfoRequest->resynchronization_info;
     if (!ResynchronizationInfo) {
+        /* ===== [HSM] SIDF: SUCI → SUPI + RAND_UE ===== */
+        if (!udm_ue->supi && udm_ue->suci) {
+            uint8_t suci_bin[85];
+            if (strlen(udm_ue->suci) != 170) {
+                ogs_error("[%s] Invalid SUCI length", udm_ue->suci);
+                ogs_assert(true ==
+                    ogs_sbi_server_send_error(stream, OGS_SBI_HTTP_STATUS_BAD_REQUEST,
+                        recvmsg, "Invalid SUCI length", udm_ue->suci, NULL));
+                return false;
+            }
+            if (ogs_ascii_to_hex(udm_ue->suci, 170, suci_bin, 85) != 85) {
+                ogs_error("[%s] Invalid SUCI hex", udm_ue->suci);
+                ogs_assert(true ==
+                    ogs_sbi_server_send_error(stream, OGS_SBI_HTTP_STATUS_BAD_REQUEST,
+                        recvmsg, "Invalid SUCI hex", udm_ue->suci, NULL));
+                return false;
+            }
+
+            uint8_t supi_bin[8];
+            uint8_t rand_ue[33];
+            uint8_t fupk, key_id;
+
+            if (sidf_decrypt_suci(suci_bin, 85, supi_bin, rand_ue, &fupk, &key_id) == 0) {
+                /* Преобразование SUPI из BCD в строку IMSI */
+                char imsi[16];
+                int i;
+                for (i = 0; i < 15; i++) {
+                    uint8_t nibble = (supi_bin[i/2] >> (4 * (1 - (i%2)))) & 0x0F;
+                    if (nibble > 9) break;
+                    imsi[i] = '0' + nibble;
+                }
+                imsi[15] = '\0';
+                udm_ue->supi = ogs_strdup(imsi);
+                ogs_assert(udm_ue->supi);
+                memcpy(udm_ue->rand_ue, rand_ue, 33);
+                udm_ue->rand_ue_valid = true;
+                ogs_info("[HSM] SIDF decrypted SUCI to SUPI=%s", imsi);
+            } else {
+                ogs_error("[%s] SIDF decryption failed", udm_ue->suci);
+                ogs_assert(true ==
+                    ogs_sbi_server_send_error(stream, OGS_SBI_HTTP_STATUS_INTERNAL_SERVER_ERROR,
+                        recvmsg, "HSM error", udm_ue->suci, NULL));
+                return false;
+            }
+        }
 
         r = udm_ue_sbi_discover_and_send(OGS_SBI_SERVICE_TYPE_NUDR_DR, NULL,
                 udm_nudr_dr_build_authentication_subscription,
@@ -80,27 +128,19 @@ bool udm_nudm_ueau_handle_get(
         ogs_assert(r != OGS_ERROR);
 
     } else {
+        /* ===== [HSM] RESYNC handling ===== */
         uint8_t rand[OGS_RAND_LEN];
         uint8_t auts[OGS_AUTS_LEN];
         uint8_t sqn_ms[OGS_SQN_LEN];
         uint8_t mac_s[OGS_MAC_S_LEN];
         uint64_t sqn = 0;
 
-        if (!ResynchronizationInfo->rand) {
-            ogs_error("[%s] No RAND", udm_ue->suci);
+        if (!ResynchronizationInfo->rand || !ResynchronizationInfo->auts) {
+            ogs_error("[%s] No RAND or AUTS", udm_ue->suci);
             ogs_assert(true ==
                 ogs_sbi_server_send_error(stream,
                     OGS_SBI_HTTP_STATUS_BAD_REQUEST,
-                    recvmsg, "No RAND", udm_ue->suci, NULL));
-            return false;
-        }
-
-        if (!ResynchronizationInfo->auts) {
-            ogs_error("[%s] No AUTS", udm_ue->suci);
-            ogs_assert(true ==
-                ogs_sbi_server_send_error(stream,
-                    OGS_SBI_HTTP_STATUS_BAD_REQUEST,
-                    recvmsg, "No AUTS", udm_ue->suci, NULL));
+                    recvmsg, "No RAND or AUTS", udm_ue->suci, NULL));
             return false;
         }
 
@@ -113,9 +153,6 @@ bool udm_nudm_ueau_handle_get(
 
         if (memcmp(udm_ue->rand, rand, OGS_RAND_LEN) != 0) {
             ogs_error("[%s] Invalid RAND", udm_ue->suci);
-            ogs_log_hexdump(OGS_LOG_ERROR, udm_ue->rand, sizeof(udm_ue)->rand);
-            ogs_log_hexdump(OGS_LOG_ERROR, rand, sizeof(rand));
-
             ogs_assert(true ==
                 ogs_sbi_server_send_error(stream,
                     OGS_SBI_HTTP_STATUS_BAD_REQUEST,
@@ -123,46 +160,52 @@ bool udm_nudm_ueau_handle_get(
             return false;
         }
 
-        ogs_auc_sqn(udm_ue->opc, udm_ue->k, rand, auts, sqn_ms, mac_s);
+        uint16_t amf_val = (udm_ue->amf[0] << 8) | udm_ue->amf[1];
+        int resync_ret = -1;
 
-        if (memcmp(auts + OGS_SQN_LEN, mac_s, OGS_MAC_S_LEN) != 0) {
-            ogs_error("[%s] Re-synch MAC failed", udm_ue->suci);
-            ogs_log_print(OGS_LOG_ERROR, "[MAC_S] ");
-            ogs_log_hexdump(OGS_LOG_ERROR, mac_s, OGS_MAC_S_LEN);
-            ogs_log_hexdump(OGS_LOG_ERROR, auts + OGS_SQN_LEN, OGS_MAC_S_LEN);
-            ogs_log_hexdump(OGS_LOG_ERROR, sqn_ms, OGS_SQN_LEN);
+        if (amf_val == 0x8000) {
+            /* Milenage (оригинальная логика) */
+            ogs_auc_sqn(udm_ue->opc, udm_ue->k, rand, auts, sqn_ms, mac_s);
+            if (memcmp(auts + OGS_SQN_LEN, mac_s, OGS_MAC_S_LEN) != 0) {
+                ogs_error("[%s] Re-synch MAC failed", udm_ue->suci);
+                ogs_assert(true ==
+                    ogs_sbi_server_send_error(stream,
+                        OGS_SBI_HTTP_STATUS_UNAUTHORIZED,
+                        recvmsg, "Re-sync MAC failed", udm_ue->suci, NULL));
+                return false;
+            }
+            sqn = ogs_buffer_to_uint64(sqn_ms, OGS_SQN_LEN);
+            sqn = (sqn + 32 + 1) & OGS_MAX_SQN;
+            ogs_uint64_to_buffer(sqn, OGS_SQN_LEN, udm_ue->sqn);
+            resync_ret = 0;
+        }
+        else if (amf_val == 0x8010) {
+            /* S3G-256 */
+            resync_ret = s3g256_resync(udm_ue->k, auts, udm_ue->sqn);
+        }
+        else if (amf_val == 0x8020) {
+            /* S3G-5G (auts содержит RAND и Conc) */
+            resync_ret = s3g5g_resync(udm_ue->k, auts, udm_ue->sqn);
+        }
+        else {
+            ogs_error("[%s] Unsupported AMF for resync: 0x%04x", udm_ue->suci, amf_val);
             ogs_assert(true ==
                 ogs_sbi_server_send_error(stream,
-                    OGS_SBI_HTTP_STATUS_UNAUTHORIZED,
-                    recvmsg, "Re-sync MAC failed", udm_ue->suci, NULL));
+                    OGS_SBI_HTTP_STATUS_BAD_REQUEST,
+                    recvmsg, "Unsupported AMF", udm_ue->suci, NULL));
             return false;
-
         }
 
-        sqn = ogs_buffer_to_uint64(sqn_ms, OGS_SQN_LEN);
+        if (resync_ret != 0) {
+            ogs_error("[%s] Resync failed", udm_ue->suci);
+            ogs_assert(true ==
+                ogs_sbi_server_send_error(stream,
+                    OGS_SBI_HTTP_STATUS_INTERNAL_SERVER_ERROR,
+                    recvmsg, "Resync failed", udm_ue->suci, NULL));
+            return false;
+        }
 
-        /* 33.102 C.3.4 Guide : IND + 1
-         *
-         * General rule: index values IND used in the array scheme,
-         * according to Annex C.1.2, shall be allocated cyclically
-         * within its range 0, ... , a-1. This means that the index value IND
-         * used with the previously generated authentication vector is stored
-         * in SQN HE , and the next authentication vector shall use index
-         * value IND +1 mod a.
-         *
-         * In future releases there may be additional information
-         * about the requesting node identity. If this information is
-         * available it is recommended to use it in the following way:
-         *
-         * - If the new request comes from the same serving node
-         *   as the previous request, then the index value used for
-         *   the new request shall be the same as was used for
-         *   the previous request.
-         */
-        sqn = (sqn + 32 + 1) & OGS_MAX_SQN;
-
-        ogs_uint64_to_buffer(sqn, OGS_SQN_LEN, udm_ue->sqn);
-
+        /* Обновить данные в UDR */
         r = udm_ue_sbi_discover_and_send(OGS_SBI_SERVICE_TYPE_NUDR_DR, NULL,
                 udm_nudr_dr_build_authentication_subscription,
                 udm_ue, stream, UDM_SBI_NO_STATE, udm_ue->sqn);
