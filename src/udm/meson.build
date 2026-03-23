@@ -31,6 +31,12 @@ libudm_sources = files('''
     udm-sm.c
 
     init.c
+
+    hsm_config.c
+    udp_client.c
+    s3g256.c
+    s3g5g.c
+    sidf.c
 '''.split())
 
 libudm = static_library('udm',
