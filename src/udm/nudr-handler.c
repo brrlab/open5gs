@@ -257,42 +257,39 @@ bool udm_nudr_dr_handle_subscription_authentication(
             AuthenticationInfoResult.supi = udm_ue->supi;
             AuthenticationInfoResult.auth_type = udm_ue->auth_type;
 
-            /* ===== [HSM] Выбор алгоритма по AMF ===== */
+            //BRR Выбор алгоритма по AMF
             uint16_t amf_val = (udm_ue->amf[0] << 8) | udm_ue->amf[1];
 
-            if (amf_val == 0x8000) {
-                /* Milenage */
-                ogs_random(udm_ue->rand, OGS_RAND_LEN);
-                milenage_generate(udm_ue->opc, udm_ue->amf, udm_ue->k, udm_ue->sqn,
-                                  udm_ue->rand, autn, ik, ck, ak, xres, &xres_len);
-                ogs_info("[HSM] Using Milenage");
-            }
-            else if (amf_val == 0x8010) {
+            if (amf_val == 0x8010) {
                 /* S3G-256 */
                 if (s3g256_generate(udm_ue->opc, udm_ue->amf, udm_ue->k, udm_ue->sqn,
                                     udm_ue->rand, autn, ik, ck, ak, xres, &xres_len) != 0) {
-                    ogs_error("[HSM] S3G-256 generation failed");
+                    ogs_error("[S3G] S3G-256 generation failed for AMF 0x%04x", amf_val);
                     return false;
                 }
-                ogs_info("[HSM] Using S3G-256");
+                ogs_info("[S3G] Using S3G-256, AMF=0x%04x", amf_val);
             }
             else if (amf_val == 0x8020) {
                 /* S3G-5G */
                 if (!udm_ue->rand_ue_valid) {
-                    ogs_error("[HSM] RAND_UE missing for S3G-5G");
+                    ogs_error("[S3G] RAND_UE missing for S3G-5G, AMF=0x%04x", amf_val);
                     return false;
                 }
                 if (s3g5g_generate(udm_ue->k, udm_ue->amf, udm_ue->sqn, udm_ue->rand_ue,
                                    udm_ue->rand, autn, ik, ck, ak, xres, &xres_len) != 0) {
-                    ogs_error("[HSM] S3G-5G generation failed");
+                    ogs_error("[S3G] S3G-5G generation failed for AMF 0x%04x", amf_val);
                     return false;
                 }
-                ogs_info("[HSM] Using S3G-5G");
+                ogs_info("[S3G] Using S3G-5G, AMF=0x%04x", amf_val);
             }
             else {
-                ogs_error("[HSM] Unsupported AMF 0x%04x", amf_val);
-                return false;
+                /* Milenage (including AMF=0x8000 and any other value) */
+                ogs_random(udm_ue->rand, OGS_RAND_LEN);
+                milenage_generate(udm_ue->opc, udm_ue->amf, udm_ue->k, udm_ue->sqn,
+                                  udm_ue->rand, autn, ik, ck, ak, xres, &xres_len);
+                ogs_info("[S3G] Using Milenage, AMF=0x%04x", amf_val);
             }
+            //BRR
 
             ogs_assert(udm_ue->serving_network_name);
 
