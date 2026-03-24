@@ -75,7 +75,7 @@ bool udm_nudm_ueau_handle_get(
 
     ResynchronizationInfo = AuthenticationInfoRequest->resynchronization_info;
     if (!ResynchronizationInfo) {
-        /* ===== [HSM] SIDF: SUCI → SUPI + RAND_UE ===== */
+        //BRR SIDF: SUCI → SUPI + RAND_UE
         if (!udm_ue->supi && udm_ue->suci) {
             uint8_t suci_bin[85];
             if (strlen(udm_ue->suci) != 170) {
@@ -120,6 +120,7 @@ bool udm_nudm_ueau_handle_get(
                 return false;
             }
         }
+        //BRR
 
         r = udm_ue_sbi_discover_and_send(OGS_SBI_SERVICE_TYPE_NUDR_DR, NULL,
                 udm_nudr_dr_build_authentication_subscription,
@@ -128,7 +129,7 @@ bool udm_nudm_ueau_handle_get(
         ogs_assert(r != OGS_ERROR);
 
     } else {
-        /* ===== [HSM] RESYNC handling ===== */
+        //BRR [HSM] RESYNC handling
         uint8_t rand[OGS_RAND_LEN];
         uint8_t auts[OGS_AUTS_LEN];
         uint8_t sqn_ms[OGS_SQN_LEN];
@@ -163,8 +164,25 @@ bool udm_nudm_ueau_handle_get(
         uint16_t amf_val = (udm_ue->amf[0] << 8) | udm_ue->amf[1];
         int resync_ret = -1;
 
-        if (amf_val == 0x8000) {
-            /* Milenage (оригинальная логика) */
+        //BRR Выбор алгоритма
+        if (amf_val == 0x8010) {
+            /* S3G-256 */
+            resync_ret = s3g256_resync(udm_ue->k, auts, udm_ue->sqn);
+            if (resync_ret != 0)
+                ogs_error("[S3G] S3G-256 resync failed for AMF 0x%04x", amf_val);
+            else
+                ogs_info("[S3G] S3G-256 resync done, AMF=0x%04x", amf_val);
+        }
+        else if (amf_val == 0x8020) {
+            /* S3G-5G */
+            resync_ret = s3g5g_resync(udm_ue->k, auts, udm_ue->sqn);
+            if (resync_ret != 0)
+                ogs_error("[S3G] S3G-5G resync failed for AMF 0x%04x", amf_val);
+            else
+                ogs_info("[S3G] S3G-5G resync done, AMF=0x%04x", amf_val);
+        }
+        else {
+            /* Milenage (original logic) for AMF=0x8000 and others */
             ogs_auc_sqn(udm_ue->opc, udm_ue->k, rand, auts, sqn_ms, mac_s);
             if (memcmp(auts + OGS_SQN_LEN, mac_s, OGS_MAC_S_LEN) != 0) {
                 ogs_error("[%s] Re-synch MAC failed", udm_ue->suci);
@@ -178,23 +196,9 @@ bool udm_nudm_ueau_handle_get(
             sqn = (sqn + 32 + 1) & OGS_MAX_SQN;
             ogs_uint64_to_buffer(sqn, OGS_SQN_LEN, udm_ue->sqn);
             resync_ret = 0;
+            ogs_info("[S3G] Milenage resync done, AMF=0x%04x", amf_val);
         }
-        else if (amf_val == 0x8010) {
-            /* S3G-256 */
-            resync_ret = s3g256_resync(udm_ue->k, auts, udm_ue->sqn);
-        }
-        else if (amf_val == 0x8020) {
-            /* S3G-5G (auts содержит RAND и Conc) */
-            resync_ret = s3g5g_resync(udm_ue->k, auts, udm_ue->sqn);
-        }
-        else {
-            ogs_error("[%s] Unsupported AMF for resync: 0x%04x", udm_ue->suci, amf_val);
-            ogs_assert(true ==
-                ogs_sbi_server_send_error(stream,
-                    OGS_SBI_HTTP_STATUS_BAD_REQUEST,
-                    recvmsg, "Unsupported AMF", udm_ue->suci, NULL));
-            return false;
-        }
+        //BRR
 
         if (resync_ret != 0) {
             ogs_error("[%s] Resync failed", udm_ue->suci);
