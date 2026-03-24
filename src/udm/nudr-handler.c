@@ -205,7 +205,7 @@ bool udm_nudr_dr_handle_subscription_authentication(
                 return false;
             }
 
-            /* ===== [HSM] SIDF: SUCI → SUPI + RAND_UE ===== */
+            //BRR SUCI → SUPI + RAND_UE
             if (!udm_ue->supi && udm_ue->suci) {
                 uint8_t suci_bin[85];
                 if (strlen(udm_ue->suci) != 170) {
@@ -250,6 +250,7 @@ bool udm_nudr_dr_handle_subscription_authentication(
                     return false;
                 }
             }
+           //BRR
 
             memset(&AuthenticationInfoResult,
                     0, sizeof(AuthenticationInfoResult));
