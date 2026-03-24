@@ -68,6 +68,13 @@ struct udm_ue_s {
     uint8_t rand[OGS_RAND_LEN];
     uint8_t sqn[OGS_SQN_LEN];
 
+    //BRR Параметры S3G5G 
+    uint8_t rand_ue[33];
+    bool rand_ue_valid;
+    uint8_t fupk;
+    uint8_t key_id; 
+    //BRR
+
     ogs_guami_t guami;
 
     OpenAPI_auth_type_e auth_type;
