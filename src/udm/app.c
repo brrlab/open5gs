@@ -30,12 +30,15 @@ int app_initialize(const char *const argv[])
     }
     ogs_info("UDM initialize...done");
 
-    //BRR
-    if (hsm_config_load("/home/user/open5gs/install/etc/open5gs/hsm.yaml") != 0) {
-        ogs_warn("HSM config not loaded, HSM disabled");
-	}
-    //BRR
-    
+    // BRR: загружаем конфигурацию HSM из той же директории, что и udm.yaml
+    char *config_dir = ogs_app()->config.path;
+    char *hsm_path = ogs_path_join(config_dir, "hsm.yaml");
+    if (hsm_config_load(hsm_path) != 0) {
+        ogs_warn("[S3G] HSM config not loaded, HSM disabled");
+    }
+    ogs_free(hsm_path);
+    // BRR
+
     return OGS_OK;
 }
 
