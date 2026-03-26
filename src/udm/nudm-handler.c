@@ -23,6 +23,144 @@
 #include "sidf.h"
 #include "s3g256.h"
 #include "s3g5g.h"
+#include "hsm_config.h"
+
+/* ===== BRR Helper function to extract Protection Scheme from SUCI ===== */
+static int suci_get_protection_scheme(const char *suci)
+{
+    if (!suci) return -1;
+    const char *p = suci;
+    if (strncmp(p, "suci-", 5) == 0) p += 5;
+    int dash = 0;
+    const char *scheme_start = NULL;
+    while (*p) {
+        if (*p == '-') {
+            dash++;
+            if (dash == 4) { /* after MCC, MNC, routing indicator */
+                scheme_start = p + 1;
+                break;
+            }
+        }
+        p++;
+    }
+    if (!scheme_start) return -1;
+    char *end;
+    long scheme = strtol(scheme_start, &end, 10);
+    if (end == scheme_start) return -1;
+    return (int)scheme;
+}
+
+/* ===== BRR Helper function to parse SUCI string and build 85-byte binary ===== */
+static int build_suci_binary(const char *suci_str, uint8_t *out_buf)
+{
+    if (!suci_str || strlen(suci_str) < 10) return -1;
+    const char *p = suci_str;
+    if (strncmp(p, "suci-", 5) != 0) return -1;
+    p += 5;
+
+    char *fields[8] = {0};
+    int i = 0;
+    char *copy = strdup(p);
+    if (!copy) return -1;
+    char *token = strtok(copy, "-");
+    while (token && i < 8) {
+        fields[i++] = token;
+        token = strtok(NULL, "-");
+    }
+    if (i < 7) {
+        free(copy);
+        return -1;
+    }
+    /* fields[0] = supi_format, [1]=MCC, [2]=MNC, [3]=Routing, [4]=Scheme, [5]=HNPKI, [6]=OutputHex */
+    /* supi_format not used, but we keep it for clarity */
+    char *mcc_str = fields[1];
+    char *mnc_str = fields[2];
+    char *routing_str = fields[3];
+    int scheme = atoi(fields[4]);
+    int hnpki = atoi(fields[5]);
+    char *output_hex = fields[6];
+
+    /* Convert digits to BCD */
+    int mcc_digits[3];
+    int j;
+    for (j = 0; j < 3; j++) {
+        if (mcc_str[j] < '0' || mcc_str[j] > '9') {
+            free(copy);
+            return -1;
+        }
+        mcc_digits[j] = mcc_str[j] - '0';
+    }
+
+    int mnc_len = strlen(mnc_str);
+    int mnc_digits[3] = {0, 0, 0xF}; /* default third digit = 0xF for 2-digit MNC */
+    for (j = 0; j < mnc_len; j++) {
+        if (mnc_str[j] < '0' || mnc_str[j] > '9') {
+            free(copy);
+            return -1;
+        }
+        mnc_digits[j] = mnc_str[j] - '0';
+    }
+    if (mnc_len == 2) {
+        mnc_digits[2] = 0xF;
+    } else if (mnc_len != 3) {
+        free(copy);
+        return -1;
+    }
+
+    int routing_len = strlen(routing_str);
+    int ri_digits[4] = {0, 0, 0, 0}; /* pad left with zeros */
+    int start = 4 - routing_len;
+    if (start < 0) {
+        free(copy);
+        return -1;
+    }
+    for (j = 0; j < routing_len; j++) {
+        if (routing_str[j] < '0' || routing_str[j] > '9') {
+            free(copy);
+            return -1;
+        }
+        ri_digits[start + j] = routing_str[j] - '0';
+    }
+
+    /* Build 8-byte header */
+    uint8_t header[8];
+    header[0] = 0x01; /* Type of identity = 1 (SUCI), SUPI format = 0, spare = 0 */
+    header[1] = (mcc_digits[1] << 4) | mcc_digits[0];
+    header[2] = (mnc_digits[2] << 4) | mcc_digits[2];
+    header[3] = (mnc_digits[1] << 4) | mnc_digits[0];
+    header[4] = (ri_digits[1] << 4) | ri_digits[0];
+    header[5] = (ri_digits[3] << 4) | ri_digits[2];
+    header[6] = (0 << 4) | (scheme & 0xF); /* spare bits = 0 */
+    header[7] = hnpki & 0xFF;
+
+    /* Decode scheme output hex */
+    size_t output_len = strlen(output_hex);
+    if (output_len % 2 != 0) {
+        free(copy);
+        return -1;
+    }
+    size_t output_bytes = output_len / 2;
+    if (output_bytes > 85 - 8) {
+        free(copy);
+        return -1;
+    }
+    uint8_t output_buf[85 - 8];
+    if (ogs_ascii_to_hex(output_hex, output_len, output_buf, sizeof(output_buf)) != output_bytes) {
+        free(copy);
+        return -1;
+    }
+
+    /* Assemble final 85-byte buffer */
+    memcpy(out_buf, header, 8);
+    memcpy(out_buf + 8, output_buf, output_bytes);
+    if (output_bytes < 85 - 8) {
+        memset(out_buf + 8 + output_bytes, 0, 85 - 8 - output_bytes);
+    }
+
+    free(copy);
+    return 0;
+}
+/* ===== BRR ===== */
 
 bool udm_nudm_ueau_handle_get(
     udm_ue_t *udm_ue, ogs_sbi_stream_t *stream, ogs_sbi_message_t *recvmsg)
@@ -30,6 +168,12 @@ bool udm_nudm_ueau_handle_get(
     OpenAPI_authentication_info_request_t *AuthenticationInfoRequest = NULL;
     OpenAPI_resynchronization_info_t *ResynchronizationInfo = NULL;
     int r;
+
+    /* ===== BRR Debug log: function entry ===== */
+    ogs_info("[S3G] === ENTER udm_nudm_ueau_handle_get ===");
+    ogs_info("[S3G] supi = %s", udm_ue->supi ? udm_ue->supi : "(null)");
+    ogs_info("[S3G] suci = %s", udm_ue->suci ? udm_ue->suci : "(null)");
+    /* ===== BRR ===== */
 
     ogs_assert(udm_ue);
     ogs_assert(stream);
@@ -74,53 +218,97 @@ bool udm_nudm_ueau_handle_get(
     ogs_assert(udm_ue->ausf_instance_id);
 
     ResynchronizationInfo = AuthenticationInfoRequest->resynchronization_info;
+
+    /* ===== BRR Debug: resync presence ===== */
+    ogs_info("[S3G] ResynchronizationInfo = %s", ResynchronizationInfo ? "present" : "NULL");
+    /* ===== BRR ===== */
+
     if (!ResynchronizationInfo) {
-        //BRR SIDF: SUCI → SUPI + RAND_UE
-        if (!udm_ue->supi && udm_ue->suci) {
+        /* ===== BRR Debug: entering non-resync branch ===== */
+        ogs_info("[S3G] No resync, checking SIDF condition");
+        ogs_info("[S3G] supi present? %s, suci present? %s",
+                 udm_ue->supi ? "yes" : "no",
+                 udm_ue->suci ? "yes" : "no");
+        /* ===== BRR ===== */
+
+        /* ===== BRR SIDF: always call for SUCI ===== */
+        if (udm_ue->suci) {
+            ogs_info("[S3G] SIDF block entered (always called for SUCI)");
+            
+            
+            int scheme = suci_get_protection_scheme(udm_ue->suci);
+            ogs_info("[S3G] SUCI Protection Scheme = %d (always use HSM)", scheme);
+        
             uint8_t suci_bin[85];
-            if (strlen(udm_ue->suci) != 170) {
-                ogs_error("[%s] Invalid SUCI length", udm_ue->suci);
-                ogs_assert(true ==
-                    ogs_sbi_server_send_error(stream, OGS_SBI_HTTP_STATUS_BAD_REQUEST,
-                        recvmsg, "Invalid SUCI length", udm_ue->suci, NULL));
+            ogs_info("[S3G] Calling build_suci_binary for SUCI: %s", udm_ue->suci);
+            if (build_suci_binary(udm_ue->suci, suci_bin) != 0) {
+                ogs_error("[%s] Failed to build SUCI binary", udm_ue->suci);
                 return false;
             }
-            if (ogs_ascii_to_hex(udm_ue->suci, 170, suci_bin, 85) != 85) {
-                ogs_error("[%s] Invalid SUCI hex", udm_ue->suci);
-                ogs_assert(true ==
-                    ogs_sbi_server_send_error(stream, OGS_SBI_HTTP_STATUS_BAD_REQUEST,
-                        recvmsg, "Invalid SUCI hex", udm_ue->suci, NULL));
-                return false;
-            }
+            ogs_info("[S3G] SUCI binary built successfully");
+
 
             uint8_t supi_bin[8];
             uint8_t rand_ue[33];
             uint8_t fupk, key_id;
 
             if (sidf_decrypt_suci(suci_bin, 85, supi_bin, rand_ue, &fupk, &key_id) == 0) {
-                /* Преобразование SUPI из BCD в строку IMSI */
-                char imsi[16];
-                int i;
-                for (i = 0; i < 15; i++) {
-                    uint8_t nibble = (supi_bin[i/2] >> (4 * (1 - (i%2)))) & 0x0F;
+                /* Декодируем SUPI из BCD в строку IMSI */
+                uint8_t supi_8bytes[8];
+                memcpy(supi_8bytes, supi_bin, 8);
+                char imsi[16] = {0};
+                int idx = 0;
+                int j;
+                /* MCC: 3 цифры */
+                for (j = 0; j < 3; j++) {
+                    uint8_t nibble = (j % 2 == 0) ? (supi_8bytes[j/2] & 0x0F) : ((supi_8bytes[j/2] >> 4) & 0x0F);
                     if (nibble > 9) break;
-                    imsi[i] = '0' + nibble;
+                    imsi[idx++] = '0' + nibble;
                 }
-                imsi[15] = '\0';
-                udm_ue->supi = ogs_strdup(imsi);
+                /* MNC: 2 или 3 цифры */
+                uint8_t next_nibble = (3 % 2 == 0) ? (supi_8bytes[3/2] & 0x0F) : ((supi_8bytes[3/2] >> 4) & 0x0F);
+                if (next_nibble == 0xF) {
+                    /* 2-digit MNC: пропускаем 0xF, берём следующие 2 цифры */
+                    int start = 4;
+                    for (j = start; j < start+2; j++) {
+                        uint8_t nibble = (j % 2 == 0) ? (supi_8bytes[j/2] & 0x0F) : ((supi_8bytes[j/2] >> 4) & 0x0F);
+                        if (nibble > 9) break;
+                        imsi[idx++] = '0' + nibble;
+                    }
+                } else {
+                    /* 3-digit MNC */
+                    for (j = 3; j < 6; j++) {
+                        uint8_t nibble = (j % 2 == 0) ? (supi_8bytes[j/2] & 0x0F) : ((supi_8bytes[j/2] >> 4) & 0x0F);
+                        if (nibble > 9) break;
+                        imsi[idx++] = '0' + nibble;
+                    }
+                }
+                /* MSIN: остальные цифры до конца */
+                for (j = 6; j < 16; j++) {
+                    uint8_t nibble = (j % 2 == 0) ? (supi_8bytes[j/2] & 0x0F) : ((supi_8bytes[j/2] >> 4) & 0x0F);
+                    if (nibble > 9) break;
+                    imsi[idx++] = '0' + nibble;
+                }
+                imsi[idx] = '\0';
+                /* Добавляем префикс "imsi-" */
+                char *full_supi = ogs_msprintf("imsi-%s", imsi);
+                if (udm_ue->supi) ogs_free(udm_ue->supi);
+                udm_ue->supi = full_supi;
                 ogs_assert(udm_ue->supi);
                 memcpy(udm_ue->rand_ue, rand_ue, 33);
                 udm_ue->rand_ue_valid = true;
-                ogs_info("[HSM] SIDF decrypted SUCI to SUPI=%s", imsi);
+                ogs_info("[S3G] SIDF decrypted SUCI to SUPI=%s", udm_ue->supi);
+                ogs_info("[S3G] RAND_UE stored (33 bytes)");
             } else {
                 ogs_error("[%s] SIDF decryption failed", udm_ue->suci);
-                ogs_assert(true ==
-                    ogs_sbi_server_send_error(stream, OGS_SBI_HTTP_STATUS_INTERNAL_SERVER_ERROR,
-                        recvmsg, "HSM error", udm_ue->suci, NULL));
                 return false;
             }
+
+
+        } else {
+            ogs_info("[S3G] No SUCI, skipping SIDF");
         }
-        //BRR
+        /* ===== BRR ===== */
 
         r = udm_ue_sbi_discover_and_send(OGS_SBI_SERVICE_TYPE_NUDR_DR, NULL,
                 udm_nudr_dr_build_authentication_subscription,
@@ -129,7 +317,7 @@ bool udm_nudm_ueau_handle_get(
         ogs_assert(r != OGS_ERROR);
 
     } else {
-        //BRR [HSM] RESYNC handling
+        /* ===== BRR RESYNC handling ===== */
         uint8_t rand[OGS_RAND_LEN];
         uint8_t auts[OGS_AUTS_LEN];
         uint8_t sqn_ms[OGS_SQN_LEN];
@@ -164,7 +352,7 @@ bool udm_nudm_ueau_handle_get(
         uint16_t amf_val = (udm_ue->amf[0] << 8) | udm_ue->amf[1];
         int resync_ret = -1;
 
-        //BRR Выбор алгоритма
+        /* ===== BRR Algorithm selection for resync ===== */
         if (amf_val == 0x8010) {
             /* S3G-256 */
             resync_ret = s3g256_resync(udm_ue->k, auts, udm_ue->sqn);
@@ -182,7 +370,7 @@ bool udm_nudm_ueau_handle_get(
                 ogs_info("[S3G] S3G-5G resync done, AMF=0x%04x", amf_val);
         }
         else {
-            /* Milenage (original logic) for AMF=0x8000 and others */
+            /* Milenage (original) for AMF=0x8000 and others */
             ogs_auc_sqn(udm_ue->opc, udm_ue->k, rand, auts, sqn_ms, mac_s);
             if (memcmp(auts + OGS_SQN_LEN, mac_s, OGS_MAC_S_LEN) != 0) {
                 ogs_error("[%s] Re-synch MAC failed", udm_ue->suci);
@@ -198,7 +386,7 @@ bool udm_nudm_ueau_handle_get(
             resync_ret = 0;
             ogs_info("[S3G] Milenage resync done, AMF=0x%04x", amf_val);
         }
-        //BRR
+        /* ===== BRR ===== */
 
         if (resync_ret != 0) {
             ogs_error("[%s] Resync failed", udm_ue->suci);
@@ -219,6 +407,15 @@ bool udm_nudm_ueau_handle_get(
 
     return true;
 }
+
+/* The rest of the file remains unchanged from the original (other functions) */
+/* ... (udm_nudm_ueau_handle_result_confirmation_inform, etc.) */
+
+/* The rest of the file remains unchanged from the original (other functions) */
+/* ... (functions: udm_nudm_ueau_handle_result_confirmation_inform, etc.) */
+
+/* Остальные функции (udm_nudm_ueau_handle_result_confirmation_inform, ...) 
+   остаются без изменений, как в исходном Open5GS. */
 
 bool udm_nudm_ueau_handle_result_confirmation_inform(
     udm_ue_t *udm_ue, ogs_sbi_stream_t *stream, ogs_sbi_message_t *message)
